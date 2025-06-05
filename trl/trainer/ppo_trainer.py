@@ -638,6 +638,7 @@ class PPOTrainer(Trainer):
                 metrics["val/ratio"] = self.accelerator.gather_for_metrics(ratio_stats).mean().item()
                 metrics["val/ratio_var"] = self.accelerator.gather_for_metrics(ratio_stats).var().item()
                 metrics["val/num_eos_tokens"] = (responses == processing_class.eos_token_id).sum().item()
+                metrics["val/seq_length_avg"] = self.accelerator.gather_for_metrics(sequence_lengths).mean().item()
                 metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
                 metrics["episode"] = self.state.episode
                 self.state.epoch = self.state.episode / self.train_dataset_len  # used by self.log
