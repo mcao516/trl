@@ -15,6 +15,7 @@
 import shutil
 
 import torch
+import wandb
 from accelerate import PartialState
 from datasets import load_dataset
 from transformers import (
@@ -80,6 +81,10 @@ if __name__ == "__main__":
     # remove output_dir if exists
     shutil.rmtree(training_args.output_dir, ignore_errors=True)
 
+    state = PartialState()
+    if state.is_main_process:
+        wandb.init(**{"project": "trl_ppo_tldr_test", "name": training_args.exp_name})
+    state.wait_for_everyone()
     ################
     # Model & Tokenizer
     ################
@@ -104,9 +109,19 @@ if __name__ == "__main__":
     value_model = AutoModelForSequenceClassification.from_pretrained(
         training_args.reward_model_path, trust_remote_code=model_args.trust_remote_code, num_labels=1
     )
+    old_score = value_model.score
+    new_score = torch.nn.Linear(old_score.in_features, old_score.out_features, bias=True)
+    new_score.weight.data = old_score.weight.data.clone()
+    new_score.bias.data.fill_(-7.94045)
+    value_model.score = new_score
     reward_model = AutoModelForSequenceClassification.from_pretrained(
         training_args.reward_model_path, trust_remote_code=model_args.trust_remote_code, num_labels=1
     )
+    old_score = reward_model.score
+    new_score = torch.nn.Linear(old_score.in_features, old_score.out_features, bias=True)
+    new_score.weight.data = old_score.weight.data.clone()
+    new_score.bias.data.fill_(-7.94045)
+    reward_model.score = new_score
     policy = AutoModelForCausalLM.from_pretrained(
         training_args.sft_model_path, trust_remote_code=model_args.trust_remote_code
     )
@@ -130,10 +145,9 @@ if __name__ == "__main__":
         """pre-tokenize the dataset before training; only collate during training"""
 
         def tokenize(element):
-            input_ids = tokenizer.apply_chat_template(
-                element["messages"][:1],
+            input_ids = tokenizer.encode(
+                element["prompt"],
                 padding=False,
-                add_generation_prompt=True,
             )
             return {"input_ids": input_ids, "lengths": len(input_ids)}
 
