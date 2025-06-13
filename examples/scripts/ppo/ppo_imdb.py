@@ -35,52 +35,23 @@ from trl import (
     get_quantization_config,
 )
 from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
+from trl.core import LengthSampler
 
 
-"""
-python examples/scripts/ppo/ppo_tldr.py \
-    --dataset_name trl-internal-testing/tldr-preference-sft-trl-style \
-    --dataset_test_split validation \
-    --learning_rate 3e-6 \
-    --output_dir models/minimal/ppo_tldr \
-    --per_device_train_batch_size 1 \
-    --gradient_accumulation_steps 64 \
-    --total_episodes 30000 \
-    --model_name_or_path EleutherAI/pythia-1b-deduped \
-    --sft_model_path cleanrl/EleutherAI_pythia-1b-deduped__sft__tldr \
-    --reward_model_path cleanrl/EleutherAI_pythia-1b-deduped__reward__tldr \
-    --missing_eos_penalty 1.0 \
-    --stop_token eos \
-    --response_length 53 \
-    --eval_strategy steps \
-    --eval_steps 100
+def resize_score_layer(model, bias_value=None):
+    in_features = model.score.in_features
+    use_bias = bias_value is not None and abs(bias_value) > 1e-5 
 
-accelerate launch --config_file examples/accelerate_configs/deepspeed_zero2.yaml \
-    examples/scripts/ppo/ppo_tldr.py \
-    --dataset_name trl-internal-testing/tldr-preference-sft-trl-style \
-    --dataset_test_split validation \
-    --output_dir models/minimal/ppo_tldr \
-    --learning_rate 3e-6 \
-    --per_device_train_batch_size 16 \
-    --gradient_accumulation_steps 4 \
-    --total_episodes 1000000 \
-    --model_name_or_path EleutherAI/pythia-1b-deduped \
-    --sft_model_path cleanrl/EleutherAI_pythia-1b-deduped__sft__tldr \
-    --reward_model_path cleanrl/EleutherAI_pythia-1b-deduped__reward__tldr \
-    --local_rollout_forward_batch_size 16 \
-    --missing_eos_penalty 1.0 \
-    --stop_token eos \
-    --eval_strategy steps \
-    --eval_steps 100
-"""
-
-
-def set_bias(model, bias_value):
-    old_score = model.score
-    new_score = torch.nn.Linear(old_score.in_features, old_score.out_features, bias=True)
-    new_score.weight.data = old_score.weight.data.clone()
-    new_score.bias.data.fill_(bias_value)
-    model.score = new_score
+    original_layer = model.score
+    original_weights = original_layer.weight.data  # Shape: [2, 768]
+    weights_for_label_1 = original_weights[1:2, :]
+    new_score_layer = torch.nn.Linear(in_features, 1, bias=use_bias)
+    with torch.no_grad():
+        new_score_layer.weight.copy_(weights_for_label_1)
+        if use_bias:
+            new_score_layer.bias.fill_(bias_value)
+    model.score = new_score_layer
+    model.config.num_labels = 1
 
 
 if __name__ == "__main__":
@@ -91,7 +62,7 @@ if __name__ == "__main__":
 
     state = PartialState()
     if state.is_main_process:
-        wandb.init(**{"project": "trl_ppo_tldr_1b", "name": training_args.exp_name})
+        wandb.init(**{"project": "trl_ppo_imdb", "name": training_args.exp_name})
     state.wait_for_everyone()
     ################
     # Model & Tokenizer
@@ -112,17 +83,21 @@ if __name__ == "__main__":
         model_args.model_name_or_path, padding_side="left", trust_remote_code=model_args.trust_remote_code
     )
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-    if tokenizer.chat_template is None:
-        tokenizer.chat_template = SIMPLE_CHAT_TEMPLATE
+
     value_model = AutoModelForSequenceClassification.from_pretrained(
-        training_args.reward_model_path, trust_remote_code=model_args.trust_remote_code, num_labels=1
+        training_args.reward_model_path, trust_remote_code=model_args.trust_remote_code, num_labels=2
     )
+    # new_score_layer = torch.nn.Linear(value_model.score.in_features, 1, bias=False)
+    # value_model.score = new_score_layer
+    resize_score_layer(value_model, bias_value=3.6)
     reward_model = AutoModelForSequenceClassification.from_pretrained(
-        training_args.reward_model_path, trust_remote_code=model_args.trust_remote_code, num_labels=1
+        training_args.reward_model_path, trust_remote_code=model_args.trust_remote_code, num_labels=2
     )
-    if script_args.bias_value is not None and abs(script_args.bias_value) > 1e-3:
-        set_bias(value_model, script_args.bias_value)
-        set_bias(reward_model, script_args.bias_value)
+    reward_model.resize_token_embeddings(len(tokenizer))
+    reward_model.config.pad_token_id = tokenizer.pad_token_id
+    # resize_score_layer(reward_model, bias_value=3.6)
+    # tokenizer.pad_token = tokenizer.eos_token
+    # reward_model.config.pad_token_id = reward_model.config.eos_token_id
     policy = AutoModelForCausalLM.from_pretrained(
         training_args.sft_model_path, trust_remote_code=model_args.trust_remote_code
     )
@@ -142,14 +117,16 @@ if __name__ == "__main__":
     train_dataset = dataset[script_args.dataset_train_split]
     eval_dataset = dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None
 
-    def prepare_dataset(dataset, tokenizer):
+    def prepare_dataset(dataset, tokenizer, input_min_text_length=2, input_max_text_length=8):
         """pre-tokenize the dataset before training; only collate during training"""
+
+        input_size = LengthSampler(input_min_text_length, input_max_text_length)
 
         def tokenize(element):
             input_ids = tokenizer.encode(
-                element["prompt"],
+                element["text"],
                 padding=False,
-            )
+            )[:input_size()]
             return {"input_ids": input_ids, "lengths": len(input_ids)}
 
         return dataset.map(
@@ -164,10 +141,6 @@ if __name__ == "__main__":
         train_dataset = prepare_dataset(train_dataset, tokenizer)
         if eval_dataset is not None:
             eval_dataset = prepare_dataset(eval_dataset, tokenizer)
-        # filtering
-        train_dataset = train_dataset.filter(lambda x: x["lengths"] <= 512, num_proc=training_args.dataset_num_proc)
-        if eval_dataset is not None:
-            eval_dataset = eval_dataset.filter(lambda x: x["lengths"] <= 512, num_proc=training_args.dataset_num_proc)
 
     assert train_dataset[0]["input_ids"][-1] != tokenizer.eos_token_id, "The last token should not be an EOS token"
     ################

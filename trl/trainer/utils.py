@@ -66,6 +66,10 @@ if is_comet_available():
 if is_peft_available():
     from peft import LoraConfig, PeftConfig
 
+import shap
+from .shap_utils import parse_sentence
+from .shap_reward import get_shap_rewards
+
 
 class DataCollatorForCompletionOnlyLM(DataCollatorForLanguageModeling):
     """
@@ -1158,7 +1162,19 @@ class OnPolicyConfig(TrainingArguments):
         default=False,
         metadata={"help": "Whether to push the model to the Hub after training."},
     )
-
+    # mine
+    reward_type: str = field(
+        default="sparse",
+        metadata={"help": "Reward type."},
+    )
+    sparse_weight: float = field(
+        default=1.0,
+        metadata={"help": "Weight of sparse rewards"},
+    )
+    dense_weight: float = field(
+        default=1.0,
+        metadata={"help": "Weight of dense rewards"},
+    )
 
 def first_true_indices(bools: torch.Tensor, dtype=torch.long):
     """
@@ -1184,7 +1200,11 @@ def first_true_indices(bools: torch.Tensor, dtype=torch.long):
 
 
 def get_reward(
-    model: torch.nn.Module, query_responses: torch.Tensor, pad_token_id: int, context_length: int
+    model: torch.nn.Module,
+    query_responses: torch.Tensor,
+    tokenizer: int,
+    context_length: int,
+    reward_type: str = "sparse",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Computes the reward logits and the rewards for a given model and query responses.
@@ -1194,8 +1214,6 @@ def get_reward(
             The model used to compute the reward logits.
         query_responses (`torch.Tensor`):
             The tensor containing the query responses.
-        pad_token_id (`int`):
-            The token ID representing the pad token.
         context_length (`int`):
             The length of the context in the query responses.
 
@@ -1208,7 +1226,7 @@ def get_reward(
             - `sequence_lengths` (`torch.Tensor`):
                 The lengths of the sequences in the query responses.
     """
-    attention_mask = query_responses != pad_token_id
+    attention_mask = query_responses != tokenizer.pad_token_id
     position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
     lm_backbone = getattr(model, model.base_model_prefix)
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
@@ -1221,16 +1239,98 @@ def get_reward(
         use_cache=False,  # otherwise mistral-based RM would error out
     )
     reward_logits = model.score(output.hidden_states[-1])
-    sequence_lengths = first_true_indices(query_responses[:, context_length:] == pad_token_id) - 1 + context_length
-    # https://github.com/huggingface/transformers/blob/dc68a39c8111217683bf49a4912d0c9018bab33d/src/transformers/models/gpt2/modeling_gpt2.py#L1454
-    return (
-        reward_logits,
-        reward_logits[
-            torch.arange(reward_logits.size(0), device=reward_logits.device),
-            sequence_lengths,
-        ].squeeze(-1),
+    if reward_logits.shape[-1] == 2:
+        reward_logits = reward_logits[:, :, 1] - reward_logits[:, :, 0]
+        reward_logits = reward_logits.unsqueeze(-1)
+    sequence_lengths = first_true_indices(query_responses[:, context_length:] == tokenizer.pad_token_id) - 1 + context_length
+    seq_rewards = reward_logits[
+        torch.arange(reward_logits.size(0), device=reward_logits.device),
         sequence_lengths,
-    )
+    ].squeeze(-1)
+    if reward_type == "sparse":
+        return (
+            reward_logits,
+            seq_rewards,
+            sequence_lengths,
+        )
+    elif reward_type == "dummy_dense":
+        batch_size = reward_logits.size(0)
+        response_max_length = query_responses.size(1) - context_length
+        dense_rewards = torch.zeros(batch_size, response_max_length).to(reward_logits)
+        return (
+            dense_rewards,
+            seq_rewards,
+            sequence_lengths,
+        )
+    elif reward_type == "abc":
+        raise NotImplementedError
+    elif reward_type == "shap_token":
+        batch_size = reward_logits.size(0)
+        response_max_length = query_responses.size(1) - context_length
+        dense_rewards = np.zeros((batch_size, response_max_length))
+        contain_eos_token = torch.any(query_responses[:, context_length:] == tokenizer.eos_token_id, dim=-1)
+        for i in range(batch_size):
+            try:
+                query_str = tokenizer.decode(query_responses[i][:context_length], skip_special_tokens=True)
+                response_str = tokenizer.decode(query_responses[i][context_length:], skip_special_tokens=True)
+                shap_outputs = get_shap_rewards(model, query_str, response_str, tokenizer)
+                m = shap_outputs.values.shape[1]
+                response_length = sequence_lengths[i] - context_length
+                # if response[-1].item() == tokenizer.eos_token_id and m + 1 == len(reward):
+                #     shap_values = np.append(shap_values, 0.0)
+                # if m != response_length and m != dense_rewards.shape[1]:
+                #     raise ValueError(f"SHAP values [{i}] has length {m} greater than the response length {response_length}.")
+                dense_rewards[i, :m] = shap_outputs.values
+            except Exception as e:
+                print("SHAP Exception: ", e)
+        dense_rewards = torch.tensor(dense_rewards).to(reward_logits)
+        return (
+            dense_rewards,
+            seq_rewards,
+            sequence_lengths,
+        )
+    elif reward_type == "shap_span":
+        batch_size = reward_logits.size(0)
+        response_max_length = query_responses.size(1) - context_length
+        dense_rewards = np.zeros((batch_size, response_max_length))
+        contain_eos_token = torch.any(query_responses[:, context_length:] == tokenizer.eos_token_id, dim=-1)
+        for i in range(batch_size):
+            try:
+                query_str = tokenizer.decode(query_responses[i][:context_length], skip_special_tokens=True)
+                response_str = tokenizer.decode(query_responses[i][context_length:], skip_special_tokens=True)
+                if len(parse_sentence(response_str)['input_ids']) == 1:
+                    print(f"Sample [{i}] cannot be parsed. Skip SHAP calculation.")
+                    continue
+                shap_outputs = get_shap_rewards(
+                    model,
+                    query_str,
+                    response_str,
+                    tokenizer,
+                    masker=shap.maskers.Text(parse_sentence, mask_token=" ", collapse_mask_token=True)
+                )
+                shap_values, shap_data = np.squeeze(shap_outputs.values), shap_outputs.data
+                assert "".join(shap_data[0]) == response_str, f"{''.join(shap_data[0])} \n {response_str}"
+                for n in range(1, len(shap_values) + 1):
+                    sents = "".join(shap_data[0][:n])
+                    idx = len(tokenizer.encode(sents)) - 1
+    
+                    if idx > len(dense_rewards[i]) - 1:
+                        print("idx: {}; response length: {}".format(idx, len(dense_rewards)))
+                        dense_rewards[i, -1] = shap_values[n-1]
+                    else:
+                        dense_rewards[i, idx] = shap_values[n-1]
+            except Exception as e:
+                print("SHAP Exception: ", e)
+        dense_rewards = torch.tensor(dense_rewards).to(reward_logits)
+        return (
+            dense_rewards,
+            seq_rewards,
+            sequence_lengths,
+        )
+    elif reward_type == "attr_lig":
+        raise NotImplementedError
+    else:
+        raise ValueError(f"Unknown reward type: {reward_type}")
 
 
 def forward(

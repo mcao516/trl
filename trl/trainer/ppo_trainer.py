@@ -418,6 +418,7 @@ class PPOTrainer(Trainer):
                 logprobs = []
                 ref_logprobs = []
                 scores = []
+                dense_scores = []
                 sequence_lengths = []
                 values = []
                 with unwrap_model_for_generation(
@@ -463,11 +464,15 @@ class PPOTrainer(Trainer):
                     sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1
                     unwrapped_value_model = accelerator.unwrap_model(model).value_model
                     full_value, _, _ = get_reward(
-                        unwrapped_value_model, query_response, processing_class.pad_token_id, context_length
+                        unwrapped_value_model, query_response, processing_class, context_length
                     )
                     value = full_value[:, context_length - 1 : -1].squeeze(-1)
-                    _, score, _ = get_reward(
-                        reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
+                    dense_score, score, _ = get_reward(
+                        reward_model,
+                        postprocessed_query_response,
+                        processing_class,
+                        context_length,
+                        reward_type=args.reward_type,
                     )
 
                     responses.append(response)
@@ -476,6 +481,7 @@ class PPOTrainer(Trainer):
                     ref_logprobs.append(ref_logprob)
                     sequence_lengths.append(sequence_length)
                     scores.append(score)
+                    dense_scores.append(dense_score)
                     values.append(value)
                 responses = torch.cat(responses, 0)
                 postprocessed_responses = torch.cat(postprocessed_responses, 0)
@@ -483,6 +489,7 @@ class PPOTrainer(Trainer):
                 ref_logprobs = torch.cat(ref_logprobs, 0)
                 sequence_lengths = torch.cat(sequence_lengths, 0)
                 scores = torch.cat(scores, 0)
+                dense_scores = torch.cat(dense_scores, 0)
                 values = torch.cat(values, 0)
                 del (logprob, ref_logprob, full_value, value, score, unwrapped_model)
                 empty_cache()
@@ -512,7 +519,13 @@ class PPOTrainer(Trainer):
                 rewards = non_score_reward.clone()
                 actual_start = torch.arange(rewards.size(0), device=rewards.device)
                 actual_end = torch.where(sequence_lengths_p1 < rewards.size(1), sequence_lengths_p1, sequence_lengths)
-                rewards[[actual_start, actual_end]] += scores
+                # rewards[[actual_start, actual_end]] += scores
+                if args.reward_type != "sparse":
+                    dense_scores = torch.masked_fill(dense_scores, padding_mask, 0)
+                    rewards[[actual_start, actual_end]] += args.sparse_weight * scores
+                    rewards += args.dense_weight * dense_scores
+                else:
+                    rewards[[actual_start, actual_end]] += args.sparse_weight * scores
 
                 # 5. whiten rewards
                 if args.whiten_rewards:
@@ -638,7 +651,7 @@ class PPOTrainer(Trainer):
                 metrics["val/ratio"] = self.accelerator.gather_for_metrics(ratio_stats).mean().item()
                 metrics["val/ratio_var"] = self.accelerator.gather_for_metrics(ratio_stats).var().item()
                 metrics["val/num_eos_tokens"] = (responses == processing_class.eos_token_id).sum().item()
-                metrics["val/seq_length_avg"] = self.accelerator.gather_for_metrics(sequence_lengths).mean().item()
+                metrics["val/seq_length_avg"] = self.accelerator.gather_for_metrics(sequence_lengths).float().mean().item()
                 metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
                 metrics["episode"] = self.state.episode
                 self.state.epoch = self.state.episode / self.train_dataset_len  # used by self.log
@@ -725,7 +738,7 @@ class PPOTrainer(Trainer):
 
                     postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
                     _, score, _ = get_reward(
-                        self.reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
+                        self.reward_model, postprocessed_query_response, processing_class, context_length
                     )
                     table["score"].extend(self.accelerator.gather_for_metrics(score).float().cpu().numpy())
 

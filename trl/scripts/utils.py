@@ -75,6 +75,12 @@ class ScriptArguments:
             "https://github.com/huggingface/transformers/issues/22482#issuecomment-1595790992."
         },
     )
+    bias_value: float = field(
+        default=None,
+        metadata={
+            "help": "Set a bias term for the reward model."
+        },
+    )
 
 
 def init_zero_verbose():
