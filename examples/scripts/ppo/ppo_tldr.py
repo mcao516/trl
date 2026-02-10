@@ -140,7 +140,8 @@ if __name__ == "__main__":
         """pre-tokenize the dataset before training; only collate during training"""
 
         def tokenize(element):
-            input_ids = tokenizer(element["prompt"], padding=False)["input_ids"]
+            input_ids = tokenizer(
+                element["chosen"][0]["content"], padding=False)["input_ids"]
             return {"input_ids": input_ids, "lengths": len(input_ids)}
 
         return dataset.map(
@@ -156,9 +157,9 @@ if __name__ == "__main__":
         if eval_dataset is not None:
             eval_dataset = prepare_dataset(eval_dataset, tokenizer)
         # filtering
-        train_dataset = train_dataset.filter(lambda x: x["lengths"] <= 512, num_proc=training_args.dataset_num_proc)
+        train_dataset = train_dataset.filter(lambda x: x["lengths"] <= 1024, num_proc=training_args.dataset_num_proc)
         if eval_dataset is not None:
-            eval_dataset = eval_dataset.filter(lambda x: x["lengths"] <= 512, num_proc=training_args.dataset_num_proc)
+            eval_dataset = eval_dataset.filter(lambda x: x["lengths"] <= 1024, num_proc=training_args.dataset_num_proc)
 
     assert train_dataset[0]["input_ids"][-1] != tokenizer.eos_token_id, "The last token should not be an EOS token"
 

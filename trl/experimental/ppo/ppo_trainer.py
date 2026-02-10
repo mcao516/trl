@@ -21,6 +21,7 @@ from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
+import shap
 
 import numpy as np
 import pandas as pd
@@ -56,9 +57,10 @@ from ...trainer.utils import (
     prepare_deepspeed,
     selective_log_softmax,
 )
-from ..utils import first_true_indices, get_reward
+from ..utils import first_true_indices, get_reward, get_shap_rewards, parse_sentence
 from .ppo_config import PPOConfig
-
+# from ..shape_utils import get_shap_rewards, parse_sentence
+import traceback
 
 if is_rich_available():
     from rich.console import Console
@@ -73,6 +75,137 @@ if is_peft_available():
 
 INVALID_LOGPROB = 1.0
 
+def get_dense_reward(
+    model: torch.nn.Module,
+    query_responses: torch.Tensor,
+    pad_token_id: int,
+    context_length: int,
+    reward_type: str = "sparse",
+    tokenizer = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Computes the reward logits and the rewards for a given model and query responses.
+
+    Args:
+        model (`torch.nn.Module`):
+            The model used to compute the reward logits.
+        query_responses (`torch.Tensor`):
+            The tensor containing the query responses.
+        pad_token_id (`int`):
+            The token ID representing the pad token.
+        context_length (`int`):
+            The length of the context in the query responses.
+
+    Returns:
+        tuple:
+            - `reward_logits` (`torch.Tensor`):
+                The logits for the reward model.
+            - `final_rewards` (`torch.Tensor`):
+                The final rewards for each query response.
+            - `sequence_lengths` (`torch.Tensor`):
+                The lengths of the sequences in the query responses.
+    """
+    attention_mask = query_responses != pad_token_id
+    position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
+    lm_backbone = getattr(model, model.base_model_prefix)
+    input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
+    sequence_lengths = first_true_indices(query_responses[:, context_length:] == pad_token_id) - 1 + context_length
+
+    # output = lm_backbone(
+    #     input_ids=input_ids,
+    #     attention_mask=attention_mask,
+    #     position_ids=position_ids,
+    #     return_dict=True,
+    #     output_hidden_states=True,
+    #     use_cache=False,  # otherwise mistral-based RM would error out
+    # )
+    # reward_logits = model.score(output.hidden_states[-1])
+    # # https://github.com/huggingface/transformers/blob/dc68a39c8111217683bf49a4912d0c9018bab33d/src/transformers/models/gpt2/modeling_gpt2.py#L1454
+    # seq_rewards = reward_logits[
+    #     torch.arange(reward_logits.size(0), device=reward_logits.device),
+    #     sequence_lengths
+    # ].squeeze(-1)
+
+    reward_logits = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        return_dict=True,
+        output_hidden_states=True,
+    )["logits"]  # reward_logits: [bsz, 1]
+    seq_rewards = reward_logits.squeeze(-1)
+
+    if False:
+        return (
+            reward_logits,
+            seq_rewards,
+            sequence_lengths,
+        )
+    elif True:
+        batch_size = reward_logits.size(0)
+        response_max_length = query_responses.size(1) - context_length
+        dense_rewards = torch.zeros(batch_size, response_max_length).to(reward_logits)
+        return (
+            dense_rewards,
+            seq_rewards,
+            sequence_lengths,
+        )
+    # elif reward_type == "shap_span":
+    elif True:
+        batch_size = reward_logits.size(0)
+        response_max_length = query_responses.size(1) - context_length
+        dense_rewards = np.zeros((batch_size, response_max_length))
+        contain_eos_token = torch.any(query_responses[:, context_length:] == tokenizer.eos_token_id, dim=-1)
+
+        # print out percentage of responses that contain eos token
+        percent_with_eos = contain_eos_token.float().mean() * 100
+        print(f"== Percentage of EOS response: {percent_with_eos.item():.2f}%")
+
+        for i in range(batch_size):
+            # if contain_eos_token[i]:
+            if True:
+                try:
+                    query_str = tokenizer.decode(query_responses[i][:context_length], skip_special_tokens=True)
+                    response_str = tokenizer.decode(query_responses[i][context_length:], skip_special_tokens=True)
+                    if len(parse_sentence(response_str)['input_ids']) == 1:
+                        print(f"Sample [{i}] cannot be parsed. Skip SHAP calculation.")
+                        dense_rewards[i, sequence_lengths[i]] = seq_rewards[i]
+                        continue
+                    
+                    shap_outputs = get_shap_rewards(
+                        model,
+                        query_str,
+                        response_str,
+                        tokenizer,
+                        masker=shap.maskers.Text(parse_sentence, mask_token=" ", collapse_mask_token=True)
+                    )
+                    shap_values, shap_data = np.squeeze(shap_outputs.values), shap_outputs.data
+                    shap_base_value = shap_outputs.base_values[0]
+                    num_spans = len(shap_values)
+                    assert len(shap_outputs.base_values) == 1, "Expected a single base value for the whole response"
+                    assert "".join(shap_data[0]) == response_str, f"{''.join(shap_data[0])} \n {response_str}"
+                    end_positions = [0]
+                    for n in range(1, len(shap_values) + 1):
+                        sents = "".join(shap_data[0][:n])
+                        idx = len(tokenizer.encode(sents)) - 1
+                        end_positions.append(idx)
+        
+                        if idx > len(dense_rewards[i]) - 1:
+                            print("idx: {}; response length: {}".format(idx, len(dense_rewards)))
+                            dense_rewards[i, -1] = shap_values[n-1] + shap_base_value / num_spans
+                        else:
+                            dense_rewards[i, idx] = shap_values[n-1] + shap_base_value / num_spans
+                except Exception as e:
+                    print("SHAP Exception: ", e)
+                    # traceback.print_exc()
+            else:
+                print(f"Sample [{i}] has no <eos> token. Skip SHAP calculation.")
+        dense_rewards = torch.tensor(dense_rewards).to(reward_logits)
+        return (
+            dense_rewards,
+            seq_rewards,
+            sequence_lengths,
+        )
 
 def generate(
     lm_backbone: torch.nn.Module, queries: torch.Tensor, pad_token_id: int, generation_config: GenerationConfig
@@ -661,6 +794,7 @@ class PPOTrainer(BaseTrainer):
                 scores = []
                 sequence_lengths = []
                 values = []
+                dense_scores = []
                 with (
                     unwrap_model_for_generation(
                         self.model,
@@ -712,10 +846,18 @@ class PPOTrainer(BaseTrainer):
                         unwrapped_value_model, query_response, processing_class.pad_token_id, context_length
                     )
                     value = full_value[:, context_length - 1 : -1].squeeze(-1)
-                    _, score, _ = get_reward(
-                        reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
+                    # _, score, _ = get_reward(
+                    #     reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
+                    # )
+                    dense_score, score, _ = get_dense_reward(
+                        reward_model,
+                        postprocessed_query_response,
+                        processing_class.pad_token_id,
+                        context_length,
+                        reward_type="sparse",
+                        tokenizer=self.processing_class,
                     )
-
+                    dense_scores.append(dense_score)
                     responses.append(response)
                     postprocessed_responses.append(postprocessed_response)
                     logprobs.append(logprob)
@@ -730,6 +872,7 @@ class PPOTrainer(BaseTrainer):
                 sequence_lengths = torch.cat(sequence_lengths, 0)
                 scores = torch.cat(scores, 0)
                 values = torch.cat(values, 0)
+                dense_scores = torch.cat(dense_scores, 0)  # [batch_size, response_max_length]
                 del (logprob, ref_logprob, full_value, value, score, unwrapped_model)
                 empty_cache()
                 gc.collect()
@@ -758,8 +901,17 @@ class PPOTrainer(BaseTrainer):
                 rewards = non_score_reward.clone()
                 actual_start = torch.arange(rewards.size(0), device=rewards.device)
                 actual_end = torch.where(sequence_lengths_p1 < rewards.size(1), sequence_lengths_p1, sequence_lengths)
-                rewards[actual_start, actual_end] += scores
+                if True:
+                    dense_scores = torch.masked_fill(dense_scores, padding_mask_p1, 0)
+                    assert rewards.shape == dense_scores.shape
+                    rewards[actual_start, actual_end] += scores * 2
+                    # rewards += dense_scores
 
+                    # dense_scores_sum = dense_scores.sum(dim=1)
+                    # # assert dense_scores_sum.shape == scores.shape
+                    # rewards[actual_start, actual_end] += dense_scores_sum
+                else:
+                    rewards[actual_start, actual_end] += scores
                 # 5. whiten rewards
                 if args.whiten_rewards:
                     rewards = masked_whiten(rewards, mask=~padding_mask_p1, shift_mean=False)
